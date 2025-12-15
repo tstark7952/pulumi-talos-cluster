@@ -97,18 +97,44 @@ portForwards:
 					limactl start %s
 				fi
 
-				# Wait for Docker to be ready
-				echo "Waiting for Docker to be ready..."
-				for i in $(seq 1 30); do
+				# Wait for Docker socket to appear
+				echo "Waiting for Docker socket to appear..."
+				for i in $(seq 1 60); do
+					if [ -S "%s" ]; then
+						echo "Docker socket found"
+						break
+					fi
+					echo "Waiting for socket... ($i/60)"
+					sleep 2
+				done
+
+				# Wait for Docker to respond to basic commands
+				echo "Waiting for Docker daemon to be ready..."
+				for i in $(seq 1 60); do
 					if DOCKER_HOST="unix://%s" docker info >/dev/null 2>&1; then
-						echo "Docker is ready"
+						echo "Docker daemon responding"
+						break
+					fi
+					echo "Waiting for Docker daemon... ($i/60)"
+					sleep 2
+				done
+
+				# Extra stabilization delay
+				echo "Allowing Docker to stabilize..."
+				sleep 10
+
+				# Verify Docker is fully functional by running a test container
+				echo "Verifying Docker is fully functional..."
+				for i in $(seq 1 10); do
+					if DOCKER_HOST="unix://%s" docker run --rm hello-world >/dev/null 2>&1; then
+						echo "Docker is fully operational"
 						DOCKER_HOST="unix://%s" docker info | grep -E "Server Version|Operating System"
 						break
 					fi
-					echo "Waiting for Docker... ($i/30)"
+					echo "Docker test failed, retrying... ($i/10)"
 					sleep 5
 				done
-			`, vmName, vmName, vmName, vmName, vmName, vmName, vmName, vmName, limaConfigPath, vmName, dockerSocket, dockerSocket)),
+			`, vmName, vmName, vmName, vmName, vmName, vmName, vmName, vmName, limaConfigPath, vmName, dockerSocket, dockerSocket, dockerSocket, dockerSocket)),
 			Delete: pulumi.String(fmt.Sprintf(`
 				echo "Stopping and deleting Lima VM %s..."
 				limactl stop %s 2>/dev/null || true
