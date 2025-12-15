@@ -1,0 +1,3 @@
+name: pulumi-talos-cluster
+runtime: go
+description: Production-grade Talos Linux Kubernetes cluster with full security hardening
