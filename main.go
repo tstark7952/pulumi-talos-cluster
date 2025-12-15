@@ -22,11 +22,32 @@ func main() {
 		talosDir := filepath.Join(homeDir, ".talos")
 		talosConfigPath := filepath.Join(talosDir, "config")
 		kubeconfigPath := filepath.Join(homeDir, ".kube", "talos-config")
+		dockerSocket := filepath.Join(homeDir, ".lima", "myk8s-docker", "sock", "docker.sock")
 
 		// Ensure talos directory exists
 		createTalosDir, err := local.NewCommand(ctx, "create-talos-dir", &local.CommandArgs{
 			Create: pulumi.String(fmt.Sprintf("mkdir -p %s", talosDir)),
 		})
+		if err != nil {
+			return err
+		}
+
+		// Check Docker is available
+		checkDocker, err := local.NewCommand(ctx, "check-docker", &local.CommandArgs{
+			Create: pulumi.String(fmt.Sprintf(`
+				if ! docker info >/dev/null 2>&1; then
+					echo "ERROR: Docker is not running or not accessible"
+					echo "Please ensure your Lima Docker VM is running:"
+					echo "  limactl start myk8s-docker"
+					exit 1
+				fi
+				echo "Docker is available"
+				docker info | grep -E "Server Version|Operating System"
+			`)),
+			Environment: pulumi.StringMap{
+				"DOCKER_HOST": pulumi.String(fmt.Sprintf("unix://%s", dockerSocket)),
+			},
+		}, pulumi.DependsOn([]pulumi.Resource{createTalosDir}))
 		if err != nil {
 			return err
 		}
@@ -66,8 +87,9 @@ func main() {
 			`, clusterName, clusterName, clusterName)),
 			Environment: pulumi.StringMap{
 				"TALOSCONFIG": pulumi.String(talosConfigPath),
+				"DOCKER_HOST": pulumi.String(fmt.Sprintf("unix://%s", dockerSocket)),
 			},
-		}, pulumi.DependsOn([]pulumi.Resource{createTalosDir}))
+		}, pulumi.DependsOn([]pulumi.Resource{checkDocker}))
 		if err != nil {
 			return err
 		}
@@ -80,8 +102,8 @@ func main() {
 				# Wait for cluster to be fully ready
 				sleep 5
 
-				# Get kubeconfig from Talos
-				/opt/homebrew/bin/talosctl kubeconfig %s --force --name %s
+				# Get kubeconfig from Talos (uses context from talosconfig)
+				/opt/homebrew/bin/talosctl kubeconfig %s --force
 
 				# Verify kubeconfig works
 				if kubectl --kubeconfig %s get nodes >/dev/null 2>&1; then
@@ -90,10 +112,11 @@ func main() {
 				else
 					echo "Warning: kubectl not able to connect yet, cluster may still be initializing"
 				fi
-			`, kubeconfigPath, kubeconfigPath, clusterName, kubeconfigPath, kubeconfigPath)),
+			`, kubeconfigPath, kubeconfigPath, kubeconfigPath, kubeconfigPath)),
 			Delete: pulumi.String(fmt.Sprintf("rm -f %s", kubeconfigPath)),
 			Environment: pulumi.StringMap{
 				"TALOSCONFIG": pulumi.String(talosConfigPath),
+				"DOCKER_HOST": pulumi.String(fmt.Sprintf("unix://%s", dockerSocket)),
 			},
 		}, pulumi.DependsOn([]pulumi.Resource{createCluster}))
 		if err != nil {
