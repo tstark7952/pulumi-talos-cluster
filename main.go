@@ -61,8 +61,12 @@ provision:
       curl -fsSL https://get.docker.com | sh
       systemctl enable docker
       systemctl start docker
-      usermod -aG docker $LIMA_CIDATA_USER
+      usermod -aG docker "${LIMA_CIDATA_USER}"
     fi
+
+    # Make Docker socket accessible without requiring group membership
+    # (group membership needs session restart to take effect)
+    chmod 666 /var/run/docker.sock
 
 portForwards:
 - guestSocket: "/var/run/docker.sock"
@@ -147,6 +151,8 @@ portForwards:
 		}
 
 		// Create Talos cluster using talosctl
+		// Skip k8s readiness check because Flannel doesn't work in Docker-in-Docker
+		// We'll install Cilium CNI after cluster creation
 		createCluster, err := local.NewCommand(ctx, "create-talos-cluster", &local.CommandArgs{
 			Create: pulumi.String(fmt.Sprintf(`
 				# Check if cluster already exists
@@ -159,10 +165,13 @@ portForwards:
 
 				# Create cluster with Docker provisioner
 				# 1 control-plane + 2 workers
+				# Skip k8s node readiness check - Flannel fails in Docker-in-Docker
+				# We'll install Cilium CNI separately
 				/opt/homebrew/bin/talosctl cluster create \
 					--name %s \
 					--controlplanes 1 \
 					--workers 2 \
+					--skip-k8s-node-readiness-check \
 					--wait \
 					--wait-timeout 10m
 
@@ -182,14 +191,23 @@ portForwards:
 			return err
 		}
 
-		// Export kubeconfig
+		// Export kubeconfig and fix server address for Lima port forwarding
 		exportKubeconfig, err := local.NewCommand(ctx, "export-kubeconfig", &local.CommandArgs{
 			Create: pulumi.String(fmt.Sprintf(`
 				echo "Exporting kubeconfig to %s..."
 				sleep 5
 
 				# Get kubeconfig from Talos
-				/opt/homebrew/bin/talosctl kubeconfig %s --force
+				/opt/homebrew/bin/talosctl --nodes 127.0.0.1 kubeconfig %s --force
+
+				# Fix the server address - Talos uses Docker network IP which isn't accessible from macOS
+				# We need to use the forwarded port (6443 is forwarded via Lima)
+				# Get the forwarded port from docker
+				K8S_PORT=$(DOCKER_HOST="unix://%s" docker port %s-controlplane-1 6443 2>/dev/null | head -1 | cut -d: -f2)
+				if [ -n "$K8S_PORT" ]; then
+					echo "Kubernetes API available on port $K8S_PORT"
+					sed -i '' "s|https://10\.[0-9]*\.[0-9]*\.[0-9]*:6443|https://127.0.0.1:$K8S_PORT|g" %s
+				fi
 
 				# Verify kubeconfig works
 				if kubectl --kubeconfig %s get nodes >/dev/null 2>&1; then
@@ -198,13 +216,49 @@ portForwards:
 				else
 					echo "Warning: kubectl not able to connect yet, cluster may still be initializing"
 				fi
-			`, kubeconfigPath, kubeconfigPath, kubeconfigPath, kubeconfigPath)),
+			`, kubeconfigPath, kubeconfigPath, dockerSocket, clusterName, kubeconfigPath, kubeconfigPath, kubeconfigPath)),
 			Delete: pulumi.String(fmt.Sprintf("rm -f %s", kubeconfigPath)),
 			Environment: pulumi.StringMap{
 				"TALOSCONFIG": pulumi.String(talosConfigPath),
 				"DOCKER_HOST": pulumi.String(fmt.Sprintf("unix://%s", dockerSocket)),
 			},
 		}, pulumi.DependsOn([]pulumi.Resource{createCluster}))
+		if err != nil {
+			return err
+		}
+
+		// Install Cilium CNI (Flannel doesn't work in Docker-in-Docker)
+		installCilium, err := local.NewCommand(ctx, "install-cilium", &local.CommandArgs{
+			Create: pulumi.String(fmt.Sprintf(`
+				export KUBECONFIG=%s
+				echo "Installing Cilium CNI..."
+
+				# Delete Flannel daemonset (it doesn't work in Docker-in-Docker)
+				kubectl delete daemonset -n kube-system kube-flannel 2>/dev/null || true
+
+				# Check if cilium CLI is installed
+				if ! command -v cilium &> /dev/null; then
+					echo "Installing Cilium CLI..."
+					CILIUM_CLI_VERSION=$(curl -s https://raw.githubusercontent.com/cilium/cilium-cli/main/stable.txt)
+					CLI_ARCH=arm64
+					curl -L --fail --remote-name-all https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/cilium-darwin-${CLI_ARCH}.tar.gz
+					sudo tar xzvfC cilium-darwin-${CLI_ARCH}.tar.gz /usr/local/bin
+					rm cilium-darwin-${CLI_ARCH}.tar.gz
+				fi
+
+				# Install Cilium
+				cilium install --version 1.16.5
+
+				# Wait for Cilium to be ready
+				echo "Waiting for Cilium to be ready..."
+				cilium status --wait --wait-duration 5m
+
+				echo "Cilium CNI installed successfully"
+			`, kubeconfigPath)),
+			Environment: pulumi.StringMap{
+				"KUBECONFIG": pulumi.String(kubeconfigPath),
+			},
+		}, pulumi.DependsOn([]pulumi.Resource{exportKubeconfig}))
 		if err != nil {
 			return err
 		}
@@ -237,7 +291,7 @@ portForwards:
 			Environment: pulumi.StringMap{
 				"KUBECONFIG": pulumi.String(kubeconfigPath),
 			},
-		}, pulumi.DependsOn([]pulumi.Resource{exportKubeconfig}))
+		}, pulumi.DependsOn([]pulumi.Resource{installCilium}))
 		if err != nil {
 			return err
 		}
